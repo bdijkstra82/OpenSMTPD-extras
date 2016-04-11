@@ -36,6 +36,7 @@ ss_to_text(const struct sockaddr_storage *ss);
 #define MAXMAIL  (SMTPD_MAXLOCALPARTSIZE + SMTPD_MAXDOMAINPARTSIZE)
 
 struct envelope {
+	int state;	/* number of other fields filled in, 0..4 */
 	struct sockaddr_storage remote;
 	char helo[SMTPD_MAXHOSTNAMELEN];
 	char from[MAXMAIL];
@@ -43,22 +44,17 @@ struct envelope {
 };
 
 static int 		 vflag;
-static int 		 first_line = 1;
-static int 		 in_hdrs = 1;
-static SPF_server_t	*spf_server;	/* XXX thread-safe? */
+static SPF_server_t	*spf_server;
 
 static struct envelope *
-envelope(uint64_t id)
+envelope(uint64_t id, int create)
 {
 	struct envelope *p;
 
 	p = filter_api_get_udata(id);
-	if (p == NULL) {
+	if (p == NULL && create) {
 		p = xmalloc(sizeof(struct envelope), "msg");
-		p->remote.ss_family = 0;
-		p->helo[0] = '\0';
-		p->from[0] = '\0';
-		p->prepend_line[0] = '\0';
+		p->state = 0;
 		filter_api_set_udata(id, p);
 	}
 	return p;
@@ -67,6 +63,7 @@ envelope(uint64_t id)
 static int
 spfcheck(uint64_t id)
 {
+	struct envelope *msg;
 	SPF_request_t	*spf_request;
 	SPF_errcode_t	 spf_errcode;
 	SPF_response_t	*spf_response = NULL;
@@ -74,7 +71,12 @@ spfcheck(uint64_t id)
 	SPF_reason_t 	 spf_reason;
 	struct sockaddr_storage *ss;
 	const char 	*ln;
-	struct envelope *msg = envelope(id);
+
+	msg = envelope(id, 0);
+	if (msg == NULL || msg->state != 3) {
+		log_debug("debug: unexpected state: %d", msg->state);
+		return -1;
+	}
 
 	spf_request = SPF_request_new(spf_server);
 	spf_errcode = spf_request ? SPF_E_SUCCESS : SPF_E_NO_MEMORY;
@@ -98,7 +100,8 @@ spfcheck(uint64_t id)
 	if (spf_errcode == SPF_E_SUCCESS)
 		spf_errcode = SPF_request_query_mailfrom(spf_request,
 								&spf_response);
-	log_debug("debug: spf_record_exp: %x", (uint32_t)spf_response->spf_record_exp);
+	log_debug("debug: spf_record_exp: %x", 
+					(uint32_t)spf_response->spf_record_exp);
 
 	if (spf_errcode != SPF_E_NO_MEMORY) {
 		spf_result = SPF_response_result(spf_response);
@@ -122,6 +125,7 @@ spfcheck(uint64_t id)
 	else
 		snprintf(msg->prepend_line, SMTPD_MAXLINESIZE, 
 			"Received-SPF: none (%s)", SPF_strerror(spf_errcode));
+	msg->state++;
 
 	SPF_response_free(spf_response);
 	SPF_request_free(spf_request);
@@ -131,28 +135,36 @@ spfcheck(uint64_t id)
 static int
 on_connect(uint64_t id, struct filter_connect *conn)
 {
-	log_debug("debug: on_connect");
-	struct envelope *msg = envelope(id);
+	struct envelope *msg;
 
+	log_debug("debug: on_connect");
+	msg = envelope(id, 1);
 	memcpy(&msg->remote, &conn->remote, sizeof(struct sockaddr_storage));
+	msg->state++;
 	return filter_api_accept(id);
 }
 
 static int
 on_helo(uint64_t id, const char *helo)
 {
+	struct envelope *msg;
+
 	log_debug("debug: on_helo");
-	struct envelope *msg = envelope(id);
+	msg = envelope(id, 1);
 	strlcpy((char *)msg->helo, helo, SMTPD_MAXHOSTNAMELEN);
+	msg->state++;
 	return filter_api_accept(id);
 }
 
 static int
 on_mail(uint64_t id, struct mailaddr *mail)
 {
+	struct envelope *msg;
+
 	log_debug("debug: on_mail");
-	struct envelope *msg = envelope(id);
+	msg = envelope(id, 1);
 	snprintf(msg->from, MAXMAIL, "%s@%s", mail->user, mail->domain);
+	msg->state++;
 	return filter_api_accept(id);
 }
 
@@ -166,11 +178,15 @@ on_rcpt(uint64_t id, struct mailaddr *rcpt)
 static int
 on_data(uint64_t id)
 {
+	struct envelope *msg;
+
 	log_debug("debug: on_data");
-	struct envelope *msg = envelope(id);
-	log_debug("debug: msg.remote = %s", ss_to_text(&msg->remote));
-	log_debug("debug: msg.helo = %s", msg->helo);
-	log_debug("debug: msg.from = %s", msg->from);
+	msg = envelope(id, 0);
+	if (msg != NULL) {
+		log_debug("debug: msg.remote = %s", ss_to_text(&msg->remote));
+		log_debug("debug: msg.helo = %s", msg->helo);
+		log_debug("debug: msg.from = %s", msg->from);
+	}
 	spfcheck(id);
 	return filter_api_accept(id);
 }
@@ -179,26 +195,26 @@ static int
 on_eom(uint64_t id, size_t size)
 {
 	log_debug("debug: on_eom");
-	struct envelope *msg = envelope(id);
-	msg->from[0] = '\0';
-	first_line = 1;
 	return filter_api_accept(id);
 }
 
 static void
 on_dataline(uint64_t id, const char *line)
 {
-	log_debug("debug: on_dataline");
-	struct envelope *msg = envelope(id);
-	if (in_hdrs && line[0] == '\0')
-		in_hdrs = 0;
-	if (first_line) {
-		first_line = 0;
-		if (msg->prepend_line[0]) {
-			filter_api_writeln(id, msg->prepend_line);
-			msg->prepend_line[0] = '\0';
-		}
-	}
+	struct envelope *msg;
+
+	msg = envelope(id, 0);
+	if (msg != NULL && msg->state == 4) {
+		log_debug("debug: on_dataline[0]");
+		filter_api_writeln(id, msg->prepend_line);
+		/* we may get another message on the same session */
+		msg->state = 2;
+		msg->from[0] = '\0';
+		msg->prepend_line[0] = '\0';
+	} else if (msg == NULL)
+		log_debug("debug: on_dataline: msg NULL");
+	else if (msg->state != 2)
+		log_debug("debug: on_dataline: state %d", msg->state);
 	filter_api_writeln(id, line);
 }
 
@@ -206,7 +222,6 @@ static void
 on_reset(uint64_t id)
 {
 	log_debug("debug: on_reset");
-	filter_api_set_udata(id, NULL);
 }
 
 static void
@@ -219,17 +234,12 @@ static void
 on_rollback(uint64_t id)
 {
 	log_debug("debug: on_rollback");
-	filter_api_set_udata(id, NULL);
 }
 
 static void
 on_disconnect(uint64_t id)
 {
 	log_debug("debug: on_disconnect");
-	struct envelope *msg = envelope(id);
-	msg->remote.ss_family = 0;
-	msg->helo[0] = '\0';
-	first_line = 1;
 	filter_api_set_udata(id, NULL);
 }
 
