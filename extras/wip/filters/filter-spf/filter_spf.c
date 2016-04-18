@@ -221,7 +221,16 @@ on_dataline(uint64_t id, const char *line)
 static void
 on_reset(uint64_t id)
 {
+	struct envelope *msg;
+
 	log_debug("debug: on_reset");
+	msg = envelope(id, 0);
+	if (msg != NULL) {
+		if (msg->state > 2)
+			msg->state = 2;
+		msg->from[0] = '\0';
+		msg->prepend_line[0] = '\0';
+	}
 }
 
 static void
@@ -233,7 +242,16 @@ on_commit(uint64_t id)
 static void
 on_rollback(uint64_t id)
 {
+	struct envelope *msg;
+
 	log_debug("debug: on_rollback");
+	msg = envelope(id, 0);
+	if (msg != NULL) {
+		if (msg->state > 2)
+			msg->state = 2;
+		msg->from[0] = '\0';
+		msg->prepend_line[0] = '\0';
+	}
 }
 
 static void
