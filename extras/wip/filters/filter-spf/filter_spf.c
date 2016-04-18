@@ -1,5 +1,3 @@
-/*      $OpenBSD$   */
-
 /*
  * Copyright (c) 2016 Boudewijn Dijkstra <boudewijn@ndva.nl>
  *
