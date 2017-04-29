@@ -43,6 +43,7 @@ struct envelope {
 
 static int 		 vflag;
 static SPF_server_t	*spf_server;
+static int enforce = 0;
 
 static struct envelope *
 envelope(uint64_t id, int create)
@@ -59,7 +60,7 @@ envelope(uint64_t id, int create)
 }
 
 static int
-spfcheck(uint64_t id)
+spfcheck(uint64_t id, SPF_result_t *out_result, char *out_comment)
 {
 	struct envelope *msg;
 	SPF_request_t	*spf_request;
@@ -72,7 +73,11 @@ spfcheck(uint64_t id)
 
 	msg = envelope(id, 0);
 	if (msg == NULL || msg->state != 3) {
-		log_debug("debug: unexpected state: %d", msg->state);
+		if (msg) {
+			log_debug("debug: unexpected state: %d", msg->state);
+		} else {
+			log_debug("debig: unexpected state: msg is NULL");
+		}
 		return -1;
 	}
 
@@ -125,6 +130,15 @@ spfcheck(uint64_t id)
 			"Received-SPF: none (%s)", SPF_strerror(spf_errcode));
 	msg->state++;
 
+	const char *comment = SPF_response_get_smtp_comment(spf_response);
+	if (comment) {
+		log_debug("debug: smtp comment: %s", comment);
+		strncpy(out_comment, comment, SMTPD_MAXLINESIZE);
+	} else {
+		snprintf(out_comment, SMTPD_MAXLINESIZE, "SPF Check failed");
+	}
+	*out_result = spf_result;
+
 	SPF_response_free(spf_response);
 	SPF_request_free(spf_request);
 	return spf_errcode;
@@ -138,7 +152,7 @@ on_connect(uint64_t id, struct filter_connect *conn)
 	log_debug("debug: on_connect");
 	msg = envelope(id, 1);
 	memcpy(&msg->remote, &conn->remote, sizeof(struct sockaddr_storage));
-	msg->state++;
+	msg->state = 1;
 	return filter_api_accept(id);
 }
 
@@ -150,7 +164,7 @@ on_helo(uint64_t id, const char *helo)
 	log_debug("debug: on_helo");
 	msg = envelope(id, 1);
 	strlcpy((char *)msg->helo, helo, SMTPD_MAXHOSTNAMELEN);
-	msg->state++;
+	msg->state = 2;
 	return filter_api_accept(id);
 }
 
@@ -161,8 +175,13 @@ on_mail(uint64_t id, struct mailaddr *mail)
 
 	log_debug("debug: on_mail");
 	msg = envelope(id, 1);
-	snprintf(msg->from, MAXMAIL, "%s@%s", mail->user, mail->domain);
-	msg->state++;
+	if (strlen(mail->user) || strlen(mail->domain)) {
+		snprintf(msg->from, MAXMAIL, "%s@%s", mail->user, mail->domain);
+	} else {
+		// A bounce
+		msg->from[0] = '\0';
+	}
+	msg->state = 3;
 	return filter_api_accept(id);
 }
 
@@ -177,16 +196,28 @@ static int
 on_data(uint64_t id)
 {
 	struct envelope *msg;
+	SPF_result_t result;
+	char comment[SMTPD_MAXLINESIZE + 1];
+	comment[SMTPD_MAXLINESIZE] = '\0';
 
 	log_debug("debug: on_data");
 	msg = envelope(id, 0);
 	if (msg != NULL) {
-		log_debug("debug: msg.remote = %s", ss_to_text(&msg->remote));
+//		log_debug("debug: msg.remote = %s", ss_to_text(&msg->remote));
 		log_debug("debug: msg.helo = %s", msg->helo);
 		log_debug("debug: msg.from = %s", msg->from);
 	}
-	spfcheck(id);
-	return filter_api_accept(id);
+	spfcheck(id, &result, comment);
+
+	if (enforce && (
+		    result == SPF_RESULT_FAIL || result == SPF_RESULT_PERMERROR
+                 || result == SPF_RESULT_TEMPERROR)) {
+		int code = result == SPF_RESULT_TEMPERROR ? 451 : 550;
+
+		return filter_api_reject_code(id, FILTER_FAIL, code, comment);
+	} else {
+		return filter_api_accept(id);
+	}
 }
 
 static int
@@ -266,10 +297,13 @@ main(int argc, char **argv)
 
 	log_init(1);
 
-	while ((ch = getopt(argc, argv, "dv")) != -1) {
+	while ((ch = getopt(argc, argv, "dev")) != -1) {
 		switch (ch) {
 		case 'd':
 			d = 1;
+			break;
+		case 'e':
+			enforce = 1;
 			break;
 		case 'v':
 			v |= TRACE_DEBUG;
